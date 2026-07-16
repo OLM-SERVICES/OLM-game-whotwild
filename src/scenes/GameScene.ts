@@ -281,7 +281,7 @@ export class GameScene extends Phaser.Scene {
     this.cardBack = this.add.container(cx, cy)
 
     this.backBase = this.add.graphics()
-    this.paintBackBase(w, h)
+    this.paintBackBase(this.backBase, w, h)
 
     this.backBadge = this.add.text(0, 0, '?', {
       fontSize: '46px',
@@ -305,8 +305,7 @@ export class GameScene extends Phaser.Scene {
     })
   }
 
-  private paintBackBase(w: number, h: number) {
-    const g = this.backBase
+  private paintBackBase(g: Phaser.GameObjects.Graphics, w: number, h: number) {
     g.clear()
     g.fillStyle(NIGHT_2, 1)
     g.fillRoundedRect(-w / 2, -h / 2, w, h, 14)
@@ -589,36 +588,171 @@ export class GameScene extends Phaser.Scene {
     this.isResolving = false
   }
 
+  // ── SHUFFLE (bridge riffle before the flip) ───────────────────────────────
+  // A three-beat riffle shuffle, modeled on how a real dealer bridges a deck:
+  //   1) SPLIT    — the stack divides into two piles that slide apart
+  //   2) BRIDGE   — each pile arcs slightly, like cards held under thumb
+  //      pressure just before release
+  //   3) INTERLEAVE — cards snap back to center alternating left/right,
+  //      staggered so each one lands with its own little "tick", instead of
+  //      the whole deck moving as one block
+  // this.cardBack is hidden for the duration and restored once the stack
+  // settles, so playFlipAnimation() picks up exactly where it did before.
+  private playShuffleAnimation(): Promise<void> {
+    return new Promise((resolve) => {
+      const cx = this.cardCX
+      const cy = this.cardCY
+      const w = 168
+      const h = 232
+      const stackSize = 10 // even, so it splits into two equal piles
+
+      this.cardBack.setVisible(false)
+
+      // Build the stack of face-down clones, centered and layered by depth.
+      const clones: Phaser.GameObjects.Container[] = []
+      for (let i = 0; i < stackSize; i++) {
+        const clone = this.add.container(cx, cy)
+        const g = this.add.graphics()
+        this.paintBackBase(g, w, h)
+        clone.add(g)
+        clone.setDepth(i)
+        clones.push(clone)
+      }
+
+      // Alternate which pile each card starts in (even depth → left,
+      // odd depth → right) so the interleave at the end reassembles into
+      // a believable riffled order, not two stacks glued back together.
+      const leftPile  = clones.filter((_, i) => i % 2 === 0)
+      const rightPile = clones.filter((_, i) => i % 2 !== 0)
+      const half = leftPile.length
+
+      // ── PHASE 1: SPLIT + BRIDGE ────────────────────────────────────────
+      const bridgeOffsetX = 46
+      const bridgeLift    = 22
+      const splitDuration = 260
+
+      this.sounds.tick?.play()
+
+      const splitPromises: Promise<void>[] = []
+
+      leftPile.forEach((card, idx) => {
+        splitPromises.push(new Promise((res) => {
+          this.tweens.add({
+            targets: card,
+            x: cx - bridgeOffsetX - idx * 2,
+            y: cy - bridgeLift + idx * 2.5,
+            angle: -8 - idx * 1.1,
+            duration: splitDuration,
+            delay: idx * 16,
+            ease: 'Sine.easeOut',
+            onComplete: () => res(),
+          })
+        }))
+      })
+
+      rightPile.forEach((card, idx) => {
+        splitPromises.push(new Promise((res) => {
+          this.tweens.add({
+            targets: card,
+            x: cx + bridgeOffsetX + idx * 2,
+            y: cy - bridgeLift + idx * 2.5,
+            angle: 8 + idx * 1.1,
+            duration: splitDuration,
+            delay: idx * 16,
+            ease: 'Sine.easeOut',
+            onComplete: () => res(),
+          })
+        }))
+      })
+
+      Promise.all(splitPromises).then(() => {
+        // ── PHASE 2: INTERLEAVE ──────────────────────────────────────────
+        // Release cards alternately from each pile back to center, staggered
+        // so it reads as a real "brrrrt" riffle. Back.easeOut gives each
+        // card a small confident snap on landing rather than a plain drift.
+        const order: Phaser.GameObjects.Container[] = []
+        for (let i = 0; i < half; i++) {
+          order.push(rightPile[half - 1 - i])
+          order.push(leftPile[half - 1 - i])
+        }
+        order.forEach((card, i) => card.setDepth(i))
+
+        const interleaveStagger = 42
+        const interleavePromises: Promise<void>[] = []
+
+        order.forEach((card, i) => {
+          interleavePromises.push(new Promise((res) => {
+            this.time.delayedCall(i * interleaveStagger, () => {
+              this.sounds.tick?.play()
+              this.tweens.add({
+                targets: card,
+                x: cx - (order.length - 1 - i) * 0.3,
+                y: cy + (order.length - 1 - i) * 0.5,
+                angle: 0,
+                duration: 200,
+                ease: 'Back.easeOut',
+                onComplete: () => res(),
+              })
+            })
+          }))
+        })
+
+        Promise.all(interleavePromises).then(() => {
+          // ── PHASE 3: SETTLE ────────────────────────────────────────────
+          // A quick collective squash sells the "deck just landed" beat
+          // before cleanup hands back to the real cardBack.
+          this.tweens.add({
+            targets: clones,
+            scale: { from: 1.04, to: 1 },
+            duration: 140,
+            ease: 'Quad.easeOut',
+            onComplete: () => {
+              clones.forEach((c) => c.destroy())
+              this.cardBack.setPosition(cx, cy)
+              this.cardBack.setAngle(0)
+              this.cardBack.setScale(1, 1)
+              this.cardBack.setVisible(true)
+              resolve()
+            },
+          })
+        })
+      })
+    })
+  }
+
   // ── FLIP + REVEAL ─────────────────────────────────────────────────────────
   private playFlipAnimation(outcome: DrawOutcome): Promise<void> {
     return new Promise((resolve) => {
-      // Short anticipation beat before the flip
-      this.sounds.tick?.play()
+      // Shuffle beat before the flip
+      this.playShuffleAnimation().then(() => {
+        // Short anticipation beat before the flip
+        this.sounds.tick?.play()
 
-      this.tweens.add({
-        targets: this.cardBack,
-        scaleX: 0,
-        duration: 180,
-        delay: 260,
-        ease: 'Quad.easeIn',
-        onComplete: () => {
-          this.cardBack.setVisible(false)
-          this.sounds.flip?.play()
+        this.tweens.add({
+          targets: this.cardBack,
+          scaleX: 0,
+          duration: 180,
+          delay: 260,
+          ease: 'Quad.easeIn',
+          onComplete: () => {
+            this.cardBack.setVisible(false)
+            this.sounds.flip?.play()
 
-          this.renderCardFace(outcome.drawnCard)
-          this.cardFront.setVisible(true)
-          this.cardFront.setScale(0, 1)
-          this.cardFront.setAlpha(1)
-          this.cardFront.setAngle(0)
+            this.renderCardFace(outcome.drawnCard)
+            this.cardFront.setVisible(true)
+            this.cardFront.setScale(0, 1)
+            this.cardFront.setAlpha(1)
+            this.cardFront.setAngle(0)
 
-          this.tweens.add({
-            targets: this.cardFront,
-            scaleX: 1,
-            duration: 180,
-            ease: 'Quad.easeOut',
-            onComplete: () => this.showResult(outcome, resolve),
-          })
-        },
+            this.tweens.add({
+              targets: this.cardFront,
+              scaleX: 1,
+              duration: 180,
+              ease: 'Quad.easeOut',
+              onComplete: () => this.showResult(outcome, resolve),
+            })
+          },
+        })
       })
     })
   }
